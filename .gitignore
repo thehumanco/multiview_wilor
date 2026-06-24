@@ -1,0 +1,19 @@
+# Training artifacts — huge, never push
+experiments/
+dataset_caches/
+lightning_logs/
+wandb/
+
+# Model checkpoints / weights
+*.ckpt
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

@@ -1,0 +1,109 @@
+# Multi-dataset WiLoR-v2 TRAINING config (yacs-mergeable).
+#
+# This is a plain yacs CfgNode that train.py merges on top of WiLoR's default_config().
+# It carries BOTH the DATASETS lists and the GENERAL/TRAIN overrides that the
+# SessionDataModule + Trainer need. MODEL/MANO/LOSS_WEIGHTS come from the pretrained WiLoR
+# model_config.yaml via load_wilor (model.wilor_cfg), not from here.
+#
+# Each DATASETS entry is one dataset: PATH = a root dir containing many sessions (auto-discovered
+# by searching for calib.npz), WEIGHT = that dataset's overall sampling proportion.
+# WEIGHTs MUST sum to 1.0 (validated at load in MixedSessionDataset).
+#
+# This file replaces the older Hydra data config. Do not add a Hydra `defaults:` block here;
+# yacs merge_from_file() cannot parse it. The old `/data_filtering: low1` default had no active
+# yacs equivalent in this training path.
+
+GENERAL:
+  # NFS-backed multi-view sessions are data-loading bound: each frame decodes V JPEGs (V up to
+  # 9, arctic frames are 2000x2800). Decode parallelism comes from worker *processes*, not
+  # threads -- _worker_init_fn pins cv2/torch to 1 thread per worker to avoid oversubscribing
+  # the cores. Scale workers toward the core count; raise PREFETCH_FACTOR to hide NFS latency
+  # spikes from the random-access WeightedRandomSampler.
+  NUM_WORKERS: 24
+  PREFETCH_FACTOR: 4
+
+TRAIN:
+  BATCH_SIZE: 16
+  NUM_EPOCHS: 100
+
+DATASETS:
+  # Multiply every bbox side by this factor before cropping. 1.0 = tight annotation bbox;
+  # 1.2 adds ~20% padding so wrists/fingertips are less likely to be clipped at the crop edge.
+  BBOX_SCALE: 1.5
+
+  # Set True only if frames/*.npz store joints_3d in the WORLD frame. These datasets store
+  # joints_3d per-view in the CAMERA frame (verified by reprojection), so keep False.
+  JOINTS3D_IN_WORLD: False
+
+  # Keep only frames with >=1 annotated hand (drops e.g. dexycb's unannotated leading frames).
+  # One-shot scan at dataset init (reads the small `data` dict, not images). Default True.
+  FILTER_EMPTY_FRAMES: True
+
+  # Cache the kept-frame list to <session>/.kept_frames_cache.json so the scan runs once per
+  # session (rebuilt automatically if frames change; skipped on read-only dirs). Default True.
+  CACHE_FRAME_INDEX: True
+
+  # CLIFF-style crop correction. WiLoR predicts in a crop-centered pinhole camera, so an
+  # off-center crop implies a tilted camera (R_crop_correction). When True, the GT root
+  # orientation and 3D joints are rotated into that crop frame (2D keypoints unchanged) so the
+  # supervision matches the network's prediction space. Matters most for hands at the image
+  # periphery (e.g. egocentric); negligible for centered hands. Default False = vanilla WiLoR.
+  # At inference, recover camera/world orientation via R_cam = R_crop_correction @ R_pred.
+  # MUST stay consistent with inference: hand_geometry.get_crop_correction_rotation applies the
+  # inverse (C) to the model output, so the training target here applies C^T. Train True ⇔ keep
+  # the inference-side correction; flip BOTH together or you get a silent ~10deg mismatch.
+  APPLY_CROP_CORRECTION: True
+
+  # Optional per-entry BAD_LEFT_VIEWS / BAD_RIGHT_VIEWS: lists of view indices to drop for that
+  # dataset+hand-side because the camera is low quality / occludes that hand (occlusion is often
+  # side-dependent, e.g. a side camera blocked by the body for the far hand only). Those (view,
+  # side) pairs never emit a valid training/eval sample (the dataloader lets them fall through to
+  # the masked empty placeholder), so they cost no image IO, forward pass, or gradient. The filter
+  # is per-dataset: it does NOT drop a view index globally (arctic view 0 != ho3d view 0). Omit
+  # both fields for datasets whose views are all good.
+
+  # NOTE: dexycb frames/*.npz were pickled with numpy>=2.0; the prometheus env (numpy 1.24)
+  # CANNOT unpickle them ("No module named 'numpy._core'"). Either load under a numpy>=2 env or
+  # re-export the dexycb frames with the training env's numpy before enabling these entries.
+  # Use multiview_pinhole (v1, has images/); multiview_pinhole_v2 has no images/ yet.
+  TRAIN:
+    # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/interhands2.6m/interhand_sessions/train
+    #   WEIGHT: 0.3
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/ho3d/ho3d_sessions/train
+      WEIGHT: 0.2
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/dexycb/processed/multiview_pinhole/train
+      WEIGHT: 0.2
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/oakink/sessions
+      WEIGHT: 0.2
+      BAD_RIGHT_VIEWS: [1]            # oakink view 1 is to the side, right hand usually occluded
+      BAD_LEFT_VIEWS: [1, 2]             # oakink view 2 is to the side, left hand usually occluded
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/arctic/sessions/train
+      WEIGHT: 0.2
+      BAD_LEFT_VIEWS: [0, 1, 2, 3]
+      BAD_RIGHT_VIEWS: [4, 5, 6, 7]
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/h2o3d/processed/train
+      WEIGHT: 0.1
+      BAD_RIGHT_VIEWS: [1, 2]
+      BAD_LEFT_VIEWS: [0, 3]
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/interhands2.6m/interhand_sessions/train
+      WEIGHT: 0.1
+
+    # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/<next_dataset>/<sessions>  # placeholder
+    #   WEIGHT: 0.0   # remember to rebalance so all TRAIN WEIGHTs sum to 1.0
+
+  # VAL can use multiple datasets just like TRAIN (weights must also sum to 1.0).
+  VAL:
+    # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/interhands2.6m/interhand_sessions/val
+    #   WEIGHT: 0.25
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/ho3d/ho3d_sessions/evaluation
+      WEIGHT: 0.5
+    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/dexycb/processed/multiview_pinhole/evaluation
+      WEIGHT: 0.5
+    # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/arctic/sessions/evaluation
+    #   WEIGHT: 0.0
+    # #   BAD_LEFT_VIEWS: [0, 1, 2, 3]
+    # #   BAD_RIGHT_VIEWS: [4, 5, 6, 7]
+    # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/h2o3d/processed/evaluation
+    #   WEIGHT: .0
+      # BAD_RIGHT_VIEWS: [1, 2]
+      # BAD_LEFT_VIEWS: [0, 3]
