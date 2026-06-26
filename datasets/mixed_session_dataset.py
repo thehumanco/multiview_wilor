@@ -132,11 +132,10 @@ def session_collate(batch: List[List[List[Dict[str, Any]]]]) -> Dict[int, Dict[s
 
     # scalar/array fields to stack (mano_params handled separately)
     tensor_fields = [
-        "img", "box_center", "box_size", "img_size", "right",
-        "betas", "keypoints_3d", "keypoints_2d", "extrinsics",
-        "K", "_trans", "R_crop_correction", "has_mano",
+        "img", "right", "keypoints_3d", "keypoints_2d",
+        "extrinsics", "R_crop_correction", "has_mano",
     ]
-    meta_fields = ["personid", "view", "hand_id", "frame_id", "valid"]
+    meta_fields = ["hand_id", "valid"]
 
     for view in range(num_views):
         # gather every hand-dict for this view across the batch

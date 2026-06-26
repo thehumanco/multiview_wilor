@@ -24,9 +24,7 @@ Ground truth (from the dataloader, masked to this view's valid hands):
     gt_mano_params: {'global_orient': (N,3), 'hand_pose': (N,45), 'betas': (N,10)}  # axis-angle
     gt_keypoints_3d: (N, 21, 4)   # camera frame, +conf
     gt_keypoints_2d: (N, 21, 3)   # crop frame, +conf
-    gt_betas:        (N, 10)
     right:           (N,)         # 1.0 right / 0.0 left
-    img_size:        (N, 2)       # [W, H]
 """
 from typing import Dict, List, Optional, Tuple
 
@@ -278,62 +276,79 @@ def compute_multiview_loss(
         return (), {}
 
     losses = []
-    term_acc = {"loss_2d": [], "loss_3d": [], "loss_go": [], "loss_hp": [], "loss_b": []}
-    for out in per_view_outputs:
-        n = out["num_hands"]
-        device = out["pred_mano_params"]["betas"].device
 
-        # ---- 2D keypoint loss ---------------------------------------------------
-        # pred: (N, 21, 2)   gt: (N, 21, 3) with conf in last dim
-        loss_2d = kp2d_loss(out["pred_keypoints_2d"], out["gt_keypoints_2d"])
+    # ---- per-hand supervised losses, batched over ALL views ---------------------
+    # Every selected view's crops were already run through ONE WiLoR forward, so the predictions
+    # live in one flat tensor and the per-view dicts are just slices of it. The base losses
+    # (Keypoint2D/3DLoss, ParameterLoss) all reduce with .sum() and no per-batch averaging, so
+    # summing them per view is identical to calling each loss ONCE over the concatenation of all
+    # views (same value, far fewer kernel launches). Concatenation is a cheap on-GPU cat — every
+    # operand is already an on-device slice.
+    device = per_view_outputs[0]["pred_mano_params"]["betas"].device
+    dtype = per_view_outputs[0]["pred_mano_params"]["betas"].dtype
 
-        # ---- 3D keypoint loss (wrist-relative) ----------------------------------
-        # pred: (N, 21, 3)   gt: (N, 21, 4) with conf in last dim
-        loss_3d = kp3d_loss(out["pred_keypoints_3d"], out["gt_keypoints_3d"], pelvis_id=0)
+    def _cat(get):
+        return torch.cat([get(o) for o in per_view_outputs], dim=0)
 
-        # ---- MANO parameter losses ----------------------------------------------
-        pred_go = out["pred_mano_params"]["global_orient"]   # (N, 1, 3, 3)
-        pred_hp = out["pred_mano_params"]["hand_pose"]       # (N, 15, 3, 3)
-        pred_b  = out["pred_mano_params"]["betas"]           # (N, 10)
+    pred_kp2d = _cat(lambda o: o["pred_keypoints_2d"])               # (N, 21, 2)
+    gt_kp2d   = _cat(lambda o: o["gt_keypoints_2d"])                 # (N, 21, 3) +conf
+    pred_kp3d = _cat(lambda o: o["pred_keypoints_3d"])               # (N, 21, 3)
+    gt_kp3d   = _cat(lambda o: o["gt_keypoints_3d"])                 # (N, 21, 4) +conf
+    pred_go = _cat(lambda o: o["pred_mano_params"]["global_orient"]) # (N, 1, 3, 3)
+    pred_hp = _cat(lambda o: o["pred_mano_params"]["hand_pose"])     # (N, 15, 3, 3)
+    pred_b  = _cat(lambda o: o["pred_mano_params"]["betas"])         # (N, 10)
+    gt_go_aa = _cat(lambda o: o["gt_mano_params"]["global_orient"])  # (N, 3)  axis-angle
+    gt_hp_aa = _cat(lambda o: o["gt_mano_params"]["hand_pose"])      # (N, 45) axis-angle
+    gt_b     = _cat(lambda o: o["gt_mano_params"]["betas"])          # (N, 10)
+    n_all = pred_b.shape[0]
 
-        gt_go_aa = out["gt_mano_params"]["global_orient"]    # (N, 3)  axis-angle
-        gt_hp_aa = out["gt_mano_params"]["hand_pose"]        # (N, 45) axis-angle
-        gt_b     = out["gt_mano_params"]["betas"]            # (N, 10)
+    # Convert GT axis-angle → rotmat to match WiLoR's prediction space (vectorized over all hands)
+    gt_go = aa_to_rotmat(gt_go_aa.reshape(-1, 3)).view(n_all, -1)   # (N, 9)
+    gt_hp = aa_to_rotmat(gt_hp_aa.reshape(-1, 3)).view(n_all, -1)   # (N, 135)
 
-        # Convert GT axis-angle → rotmat to match WiLoR's prediction space
-        gt_go = aa_to_rotmat(gt_go_aa.reshape(-1, 3)).view(n, -1)   # (N, 9)
-        gt_hp = aa_to_rotmat(gt_hp_aa.reshape(-1, 3)).view(n, -1)   # (N, 135)
+    # Keypoint-only hands (e.g. egoexo4d) carry no MANO fit -> gt_has_mano masks the MANO-
+    # parameter terms so the placeholder zeros don't supervise. Per view it is a (n,) mask or
+    # None (all GT present); concatenate, treating None as all-ones for that view.
+    if all(o.get("gt_has_mano") is None for o in per_view_outputs):
+        has_all = torch.ones(n_all, device=device, dtype=dtype)
+    else:
+        has_all = torch.cat([
+            (torch.ones(o["num_hands"], device=device, dtype=dtype)
+             if o.get("gt_has_mano") is None
+             else o["gt_has_mano"].to(device=device, dtype=dtype))
+            for o in per_view_outputs
+        ], dim=0)
 
-        # Keypoint-only hands (e.g. egoexo4d) carry no MANO fit -> gt_has_mano masks the
-        # MANO-parameter terms so the placeholder zeros don't supervise. Default: all GT present.
-        has_all = out.get("gt_has_mano")
-        has_all = (torch.ones(n, device=device, dtype=pred_b.dtype)
-                   if has_all is None else has_all.to(device=device, dtype=pred_b.dtype))
+    loss_2d = kp2d_loss(pred_kp2d, gt_kp2d)
+    loss_3d = kp3d_loss(pred_kp3d, gt_kp3d, pelvis_id=0)
+    loss_go = param_loss(pred_go.reshape(n_all, -1), gt_go, has_all)
+    loss_hp = param_loss(pred_hp.reshape(n_all, -1), gt_hp, has_all)
+    loss_b  = param_loss(pred_b,                     gt_b,  has_all)
 
-        loss_go = param_loss(pred_go.reshape(n, -1), gt_go, has_all)
-        loss_hp = param_loss(pred_hp.reshape(n, -1), gt_hp, has_all)
-        loss_b  = param_loss(pred_b,                 gt_b,  has_all)
+    losses.append(
+        loss_weights["KEYPOINTS_2D"]    * loss_2d
+        + loss_weights["KEYPOINTS_3D"]  * loss_3d
+        + loss_weights["GLOBAL_ORIENT"] * loss_go
+        + loss_weights["HAND_POSE"]     * loss_hp
+        + loss_weights["BETAS"]         * loss_b
+    )
 
-        # ---- weighted sum -------------------------------------------------------
-        loss = (
-            loss_weights["KEYPOINTS_2D"]    * loss_2d
-            + loss_weights["KEYPOINTS_3D"]  * loss_3d
-            + loss_weights["GLOBAL_ORIENT"] * loss_go
-            + loss_weights["HAND_POSE"]     * loss_hp
-            + loss_weights["BETAS"]         * loss_b
-        )
-        for k, v in zip(term_acc, (loss_2d, loss_3d, loss_go, loss_hp, loss_b)):
-            term_acc[k].append(v.detach())
-        losses.append(loss)
+    # per-term logging: the batched terms are sums over all hands; report a per-hand mean so the
+    # scalar is stable across batches of different hand counts.
+    inv_n = 1.0 / max(n_all, 1)
+    term_means = {
+        "loss_2d": loss_2d.detach() * inv_n,
+        "loss_3d": loss_3d.detach() * inv_n,
+        "loss_go": loss_go.detach() * inv_n,
+        "loss_hp": loss_hp.detach() * inv_n,
+        "loss_b":  loss_b.detach()  * inv_n,
+    }
 
     # ---- adversarial generator loss (one term covering all views) ---------------
-    # Collect predictions from every view into a single tensor and try to fool the
-    # discriminator: we want disc_out → 1 (real), so loss = mean((disc_out - 1)^2).
+    # Reuse the already-concatenated predictions and try to fool the discriminator: we want
+    # disc_out → 1 (real), so loss = mean((disc_out - 1)^2).
     if discriminator is not None and loss_weights["ADVERSARIAL"] > 0:
-        all_hp = torch.cat([o["pred_mano_params"]["hand_pose"] for o in per_view_outputs], dim=0)
-        all_b  = torch.cat([o["pred_mano_params"]["betas"]     for o in per_view_outputs], dim=0)
-        n_all  = all_hp.shape[0]
-        disc_out = discriminator(all_hp.reshape(n_all, -1), all_b)
+        disc_out = discriminator(pred_hp.reshape(n_all, -1), pred_b)
         loss_adv = ((disc_out - 1.0) ** 2).sum() / n_all
         losses.append(loss_weights["ADVERSARIAL"] * loss_adv)
 
@@ -350,7 +365,7 @@ def compute_multiview_loss(
     if kp3d_world_total.requires_grad or float(kp3d_world_total) != 0.0:
         losses.append(kp3d_world_total)
 
-    breakdown = {k: torch.stack(v).mean() for k, v in term_acc.items() if v}
+    breakdown = dict(term_means)
     breakdown.update(consistency_breakdown)
     breakdown["loss_consistency"] = consistency_total.detach()
     breakdown["loss_kp3d_world"] = kp3d_world_unw

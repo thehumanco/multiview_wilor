@@ -9,8 +9,7 @@ outputs back into per-(frame, view) dicts and hands them to ``compute_multiview_
 Design (see MULTIVIEW_MODEL.md): one shared-weight WiLoR, a single batched forward over all
 1-MAX_VIEWS selected-view crops (no padding, no per-view loop, no 4 separate weight sets).
 """
-import contextlib
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -20,12 +19,10 @@ from pytorch_lightning.loggers import WandbLogger
 from src.metric_hand_tracking.wilor.models import load_wilor
 
 from .losses import compute_multiview_loss, discriminator_step
-from .lora import inject_lora_linear
 from .multiview_fusion import MultiViewFusion
 from .view_sampling import select_views, ViewSelection
 
-# GT fields carried per view from the collated batch (sliced by the view's row mask).
-_GT_TENSOR_FIELDS = ("keypoints_3d", "keypoints_2d", "betas", "right", "img_size", "extrinsics")
+# GT MANO param keys carried per view from the collated batch (sliced by the view's row mask).
 _GT_MANO_KEYS = ("global_orient", "hand_pose", "betas")
 
 
@@ -41,15 +38,8 @@ class MultiViewWiLoR(pl.LightningModule):
         grad_clip_val: float = 0.0,
         log_media_every_n_steps: int = 0,
         num_log_images: int = 4,
-        use_fusion: bool = True,
         fusion_layers: int = 8,
         fuse_camera_extrinsics: bool = False,
-        refine_lora: bool = False,
-        refine_lora_rank: int = 64,
-        refine_lora_alpha: Optional[float] = None,
-        vit_backbone_lora: bool = False,
-        vit_lora_rank: int = 64,
-        vit_lora_alpha: Optional[float] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -64,52 +54,17 @@ class MultiViewWiLoR(pl.LightningModule):
         # Multi-view fusion (VGGT-style alternating attention) between the frozen ViT trunk
         # and the per-view decoders. Identity at init (zero-gated), so step 0 == pretrained
         # WiLoR. Trainable: fusion + token decode heads + RefineNet; frozen: ViT trunk.
-        self.use_fusion = use_fusion
         # Optionally inject per-view camera extrinsics into the fusion attention (see
-        # CameraExtrinsicsEmbed). Only meaningful when fusion is on (it lives at the fusion entry).
-        if fuse_camera_extrinsics and not use_fusion:
-            raise ValueError("fuse_camera_extrinsics requires fusion (do not pass --no-fusion)")
+        # CameraExtrinsicsEmbed); it lives at the fusion entry.
         self._fuse_cam = fuse_camera_extrinsics
-        if use_fusion:
-            self.fusion = MultiViewFusion.from_backbone(
-                self.wilor.backbone, num_layers=fusion_layers,
-                fuse_camera_extrinsics=fuse_camera_extrinsics,
-            )
-            bb = self.wilor.backbone
-            bb.requires_grad_(False)
-            for head in (bb.decpose, bb.decshape, bb.deccam):  # per-view decoders stay trainable
-                head.requires_grad_(True)
-        else:
-            self.fusion = None
-
-        # Optional LoRA on the ViT trunk itself. The fusion design otherwise freezes the trunk and
-        # adapts only the decode heads + fusion; this instead trains medium-rank (default 64)
-        # low-rank deltas on every attention/MLP linear in the trunk blocks, so the *features* can
-        # adapt for multi-view while the pretrained weights stay frozen (no catastrophic forgetting).
-        # NB: this makes the trunk forward build an autograd graph (see forward_step's trunk_ctx),
-        # so it is no longer wrapped in torch.no_grad() and uses more memory.
-        self._vit_backbone_lora = vit_backbone_lora
-        if vit_backbone_lora:
-            alpha = vit_lora_alpha if vit_lora_alpha is not None else float(vit_lora_rank)
-            self.wilor.backbone.blocks.requires_grad_(False)
-            wrapped = inject_lora_linear(self.wilor.backbone.blocks, vit_lora_rank, alpha)
-            print(f"[MultiViewWiLoR] ViT backbone LoRA (rank={vit_lora_rank}, alpha={alpha}) "
-                  f"on {len(wrapped)} trunk linear layers")
-
-        # Per-view refinement (WiLoR RefineNet) adaptation. By default it is fully fine-tuned
-        # (its weights are already independent of the backbone decode heads — a distinct module
-        # with its own dec_pose/dec_shape/dec_cam + deconv). With refine_lora=True we instead
-        # FREEZE the pretrained RefineNet and train only high-rank LoRA deltas on its linear
-        # heads, preserving the pretrained refinement (no catastrophic forgetting). The deconv
-        # feature extractor (Conv/BatchNorm, no Linear) stays frozen. Flip the flag off to revert
-        # to full finetuning — nothing else changes.
-        self._refine_lora = refine_lora
-        if refine_lora:
-            alpha = refine_lora_alpha if refine_lora_alpha is not None else float(refine_lora_rank)
-            self.wilor.refine_net.requires_grad_(False)
-            wrapped = inject_lora_linear(self.wilor.refine_net, refine_lora_rank, alpha)
-            print(f"[MultiViewWiLoR] RefineNet LoRA (rank={refine_lora_rank}, alpha={alpha}) "
-                  f"on layers: {wrapped}")
+        self.fusion = MultiViewFusion.from_backbone(
+            self.wilor.backbone, num_layers=fusion_layers,
+            fuse_camera_extrinsics=fuse_camera_extrinsics,
+        )
+        bb = self.wilor.backbone
+        bb.requires_grad_(False)
+        for head in (bb.decpose, bb.decshape, bb.deccam):  # per-view decoders stay trainable
+            head.requires_grad_(True)
 
         self.max_views = max_views
         self.lr = lr
@@ -135,17 +90,10 @@ class MultiViewWiLoR(pl.LightningModule):
         self.automatic_optimization = False
 
     def train(self, mode: bool = True):
-        """Keep the frozen ViT trunk in eval whenever fusion is on: its blocks carry heavy
-        stochastic depth (drop_path up to 0.55) which would randomize the 'frozen' features."""
+        """Keep the frozen ViT trunk in eval: its blocks carry heavy stochastic depth
+        (drop_path up to 0.55) which would randomize the 'frozen' features."""
         super().train(mode)
-        if self.use_fusion or self._vit_backbone_lora:
-            # Keep the trunk in eval so its heavy stochastic depth (drop_path up to 0.55) stays
-            # deterministic — the trainable LoRA adapters are pure linear and unaffected by eval.
-            self.wilor.backbone.eval()
-        if self._refine_lora:
-            # LoRA freezes the RefineNet base: keep it in eval so its BatchNorm running stats
-            # don't drift (the trainable LoRA adapters are pure linear, unaffected by eval).
-            self.wilor.refine_net.eval()
+        self.wilor.backbone.eval()
         return self
 
     def _generator_parameters(self) -> List[torch.nn.Parameter]:
@@ -185,20 +133,56 @@ class MultiViewWiLoR(pl.LightningModule):
         K[:, 2, 2] = 1.0
         return K
 
+    def _gather_flat_gt(self, batch: Dict[int, Dict], sel: List[ViewSelection]) -> Dict:
+        """Gather every GT field across all selected (frame, view) rows into flat tensors in
+        the SAME row order as ``_gather_crops``, moved to the device ONCE per field.
+
+        ``_split_outputs`` then slices these on-device tensors per view, instead of issuing a
+        separate host->device copy per field per view (dozens of tiny synchronous transfers a
+        step). ``non_blocking=True`` lets the copies overlap compute since the dataloader pins
+        memory (``pin_memory=True``).
+        """
+        def cat(field: str) -> torch.Tensor:
+            return torch.cat(
+                [batch[s.view][field][s.row_mask] for s in sel], dim=0
+            ).to(self.device, non_blocking=True)
+
+        flat = {
+            "extrinsics": cat("extrinsics"),
+            "R_crop_correction": cat("R_crop_correction"),
+            "hand_id": cat("hand_id"),
+            "keypoints_3d": cat("keypoints_3d"),
+            "keypoints_2d": cat("keypoints_2d"),
+            "right": cat("right"),
+            "mano_params": {
+                k: torch.cat(
+                    [batch[s.view]["mano_params"][k][s.row_mask] for s in sel], dim=0
+                ).to(self.device, non_blocking=True)
+                for k in _GT_MANO_KEYS
+            },
+        }
+        # per-hand MANO-GT mask (0 for keypoint-only hands, e.g. egoexo4d). Absent on older
+        # batches -> None, and the loss falls back to all-ones.
+        flat["has_mano"] = cat("has_mano") if "has_mano" in batch[sel[0].view] else None
+        return flat
+
     def _split_outputs(
-        self, out: Dict, batch: Dict[int, Dict], sel: List[ViewSelection]
+        self, out: Dict, imgs: torch.Tensor, flat_gt: Dict, sel: List[ViewSelection]
     ) -> List[Dict]:
         """Scatter the single batched WiLoR output back into one dict per selected view,
-        attaching that view's masked GT. See losses.compute_multiview_loss for the contract."""
+        attaching that view's GT. Every value is an on-device slice of ``out`` (predictions),
+        ``imgs`` (crops, in the same row order), or ``flat_gt`` (GT gathered once by
+        ``_gather_flat_gt``) — no per-field host->device copies. ``out``/``imgs``/``flat_gt`` are
+        all in ``sel`` row order with the same per-selection offsets, so ``rows`` indexes them
+        identically. See losses.compute_multiview_loss for the contract."""
         K = self._predicted_K(out["focal_length"])
+        has_mano = flat_gt["has_mano"]
         per_view: List[Dict] = []
         offset = 0
         for s in sel:
             n = s.num_hands
             rows = slice(offset, offset + n)
             offset += n
-            view_dict = batch[s.view]
-            m = s.row_mask
 
             per_view.append({
                 "frame": s.frame,
@@ -212,26 +196,19 @@ class MultiViewWiLoR(pl.LightningModule):
                 "pred_keypoints_2d": out["pred_keypoints_2d"][rows],
                 "focal_length": out["focal_length"][rows],
                 "K": K[rows],
-                "extrinsics": view_dict["extrinsics"][m].to(self.device),
+                "extrinsics": flat_gt["extrinsics"][rows],
                 # crop->camera rotation (undoes the crop tilt); needed to map predictions to world
-                "R_crop_correction": view_dict["R_crop_correction"][m].to(self.device),
+                "R_crop_correction": flat_gt["R_crop_correction"][rows],
                 # per-frame hand identity; matches the same physical hand across views
-                "hand_id": view_dict["hand_id"][m].to(self.device),
+                "hand_id": flat_gt["hand_id"][rows],
                 # --- ground truth (masked to this view's valid hands) ---
-                "gt_mano_params": {
-                    k: view_dict["mano_params"][k][m].to(self.device) for k in _GT_MANO_KEYS
-                },
-                "gt_keypoints_3d": view_dict["keypoints_3d"][m].to(self.device),
-                "gt_keypoints_2d": view_dict["keypoints_2d"][m].to(self.device),
-                "gt_betas": view_dict["betas"][m].to(self.device),
-                # per-hand MANO-GT mask (0 for keypoint-only hands, e.g. egoexo4d); masks the
-                # MANO-parameter losses. Absent on older batches -> loss falls back to all-ones.
-                "gt_has_mano": view_dict["has_mano"][m].to(self.device)
-                if "has_mano" in view_dict else None,
-                "right": view_dict["right"][m].to(self.device),
-                "img_size": view_dict["img_size"][m].to(self.device),
+                "gt_mano_params": {k: v[rows] for k, v in flat_gt["mano_params"].items()},
+                "gt_keypoints_3d": flat_gt["keypoints_3d"][rows],
+                "gt_keypoints_2d": flat_gt["keypoints_2d"][rows],
+                "gt_has_mano": has_mano[rows] if has_mano is not None else None,
+                "right": flat_gt["right"][rows],
                 # Normalized crop pixels, kept only for media logging (not used by the loss).
-                "img": view_dict["img"][m].to(self.device),
+                "img": imgs[rows],
             })
         return per_view
 
@@ -288,23 +265,16 @@ class MultiViewWiLoR(pl.LightningModule):
         if len(sel) == 0:
             return {"selections": [], "per_view": []}
 
-        imgs = self._gather_crops(batch, sel).to(self.device)
-        if self.use_fusion:
-            # Frozen trunk -> alternating-attention fusion across each hand's views -> the
-            # pretrained decode heads + RefineNet (per view, unchanged). With backbone LoRA the
-            # trunk is no longer fully frozen, so its forward must build a graph for the LoRA
-            # deltas to receive gradients (nullcontext keeps train-time grad, and validation's
-            # outer inference_mode still disables it).
-            trunk_ctx = contextlib.nullcontext() if self._vit_backbone_lora else torch.no_grad()
-            with trunk_ctx:
-                tokens, (Hp, Wp) = self.wilor.backbone.forward_tokens(imgs[:, :, :, 32:-32])
-            fused = self._fuse_views(tokens, batch, sel)
-            backbone_out = self.wilor.backbone.decode_tokens(fused, Hp, Wp)
-            out = self.wilor.forward_step({"img": imgs}, train=self.training, backbone_out=backbone_out)
-        else:
-            # WiLoR.forward_step only reads batch['img'].
-            out = self.wilor.forward_step({"img": imgs}, train=self.training)
-        per_view = self._split_outputs(out, batch, sel)
+        imgs = self._gather_crops(batch, sel).to(self.device, non_blocking=True)
+        # Frozen trunk -> alternating-attention fusion across each hand's views -> the
+        # pretrained decode heads + RefineNet (per view, unchanged).
+        with torch.no_grad():
+            tokens, (Hp, Wp) = self.wilor.backbone.forward_tokens(imgs[:, :, :, 32:-32])
+        fused = self._fuse_views(tokens, batch, sel)
+        backbone_out = self.wilor.backbone.decode_tokens(fused, Hp, Wp)
+        out = self.wilor.forward_step({"img": imgs}, train=self.training, backbone_out=backbone_out)
+        flat_gt = self._gather_flat_gt(batch, sel)
+        per_view = self._split_outputs(out, imgs, flat_gt, sel)
         return {"selections": sel, "per_view": per_view}
 
     def forward(self, batch: Dict[int, Dict]) -> Dict:

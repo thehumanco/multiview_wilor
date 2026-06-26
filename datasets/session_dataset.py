@@ -252,41 +252,21 @@ class SessionDataset:
         s = self.img_size
         return {
             "img": np.zeros((3, s, s), dtype=np.float32),
-            "personid": -1,
-            "box_center": np.zeros(2, dtype=np.float32),
-            "box_size": np.float32(0.0),
-            "img_size": self.calib_img_size[view].copy(),
             "right": np.float32(1.0),
             "mano_params": {
                 "global_orient": np.zeros(3, dtype=np.float32),
                 "hand_pose": np.zeros(45, dtype=np.float32),
                 "betas": np.zeros(10, dtype=np.float32),
             },
-            "betas": np.zeros(10, dtype=np.float32),
-            "has_mano_params": {
-                "global_orient": np.array(0.0),
-                "hand_pose": np.array(0.0),
-                "betas": np.array(0.0),
-            },
             "has_mano": np.float32(0.0),
-            "mano_params_is_axis_angle": {
-                "global_orient": True,
-                "hand_pose": True,
-                "betas": False,
-            },
             "keypoints_3d": np.zeros((NUM_KEYPOINTS, 4), dtype=np.float32),
             "keypoints_2d": np.zeros((NUM_KEYPOINTS, 3), dtype=np.float32),
             "extrinsics": np.concatenate(
                 [self.R_w2c[view], self.t_w2c[view][:, None]], axis=1
             ).astype(np.float32),
-            "K": self.K[view].copy(),
-            "_trans": np.eye(2, 3, dtype=np.float32),
             "R_crop_correction": np.eye(3, dtype=np.float32),
             "valid": False,
-            "view": view,
             "hand_id": -1,
-            "frame_id": -1,
-            "session": self.path,
         }
 
     def _world_to_cam_global_orient(
@@ -338,11 +318,6 @@ class SessionDataset:
             "global_orient": _hm,
             "hand_pose": _hm,
             "betas": _hm,
-        }
-        mano_params_is_axis_angle = {
-            "global_orient": True,
-            "hand_pose": True,
-            "betas": False,
         }
 
         # --- per-joint confidence (mask) ---
@@ -435,35 +410,21 @@ class SessionDataset:
         )
 
         return {
-            # --- ViTDetDataset field schema ---
             "img": img_patch,
-            "personid": int(hand["hand_id"]),
-            "box_center": center.astype(np.float32),
-            "box_size": np.float32(bbox_size),
-            "img_size": 1.0 * img_size[::-1].copy(),  # [W,H]
             "right": np.float32(1.0 if is_right else 0.0),
             # --- training GT ---
             "mano_params": mano_params,
-            "betas": betas,
             "keypoints_3d": keypoints_3d.astype(np.float32),  # camera frame, (21,4)
             "keypoints_2d": keypoints_2d.astype(np.float32),  # crop frame, (21,3)
-            "has_mano_params": has_mano_params,
-            # scalar form of has_mano_params, forwarded by session_collate so the multiview loss
-            # can mask the MANO-parameter terms for keypoint-only hands (egoexo4d).
+            # scalar MANO-GT mask, forwarded by session_collate so the multiview loss can mask
+            # the MANO-parameter terms for keypoint-only hands (egoexo4d).
             "has_mano": np.float32(1.0 if has_mano else 0.0),
-            "mano_params_is_axis_angle": mano_params_is_axis_angle,
             "extrinsics": np.concatenate(
                 [R_w2c_eff, t_w2c_eff[:, None]], axis=1
             ).astype(np.float32),  # (3,4) world->cam
-            "K": self.K[view].copy(),
-            "_trans": trans,
             "R_crop_correction": R_crop_correction,  # (3,3) crop-center ray alignment
             "valid": True,
-            # --- debug ---
-            "view": view,
             "hand_id": int(hand["hand_id"]),
-            "frame_id": int(frame_id),
-            "session": self.path,
         }
 
     # ------------------------------------------------------------------ main

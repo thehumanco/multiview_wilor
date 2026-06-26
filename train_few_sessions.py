@@ -167,13 +167,11 @@ def main() -> None:
                    help="Max sessions to load per dataset entry (keeps startup fast)")
     # multi-view
     p.add_argument("--max-views", type=int, default=4)
-    p.add_argument("--no-fusion", action="store_true",
-                   help="Disable the multi-view fusion transformer (per-view WiLoR + consistency loss only)")
     p.add_argument("--fusion-layers", type=int, default=8,
                    help="Number of alternating global/frame fusion layers (init from the ViT's last blocks)")
     p.add_argument("--fuse-camera-extrinsics", action="store_true",
                    help="Inject per-view camera pose (relative-to-reference) into the multi-view "
-                        "fusion attention; requires fusion (do not pass --no-fusion)")
+                        "fusion attention")
     # augmentation (mirror DATASETS.CONFIG.*); None -> keep config default
     p.add_argument("--scale-factor", type=float, default=None)
     p.add_argument("--rot-factor", type=float, default=None)
@@ -211,7 +209,6 @@ def main() -> None:
         wilor_ckpt=args.ckpt,
         wilor_cfg=args.wilor_cfg,
         max_views=args.max_views,
-        use_fusion=not args.no_fusion,
         fusion_layers=args.fusion_layers,
         fuse_camera_extrinsics=args.fuse_camera_extrinsics,
         lr=args.lr,

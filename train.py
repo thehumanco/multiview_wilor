@@ -20,10 +20,12 @@ import warnings
 # Must run before smplx/chumpy are imported (they get pulled in transitively when
 # a MANO model is unpickled). Patches inspect.getargspec and the removed numpy
 # scalar aliases that chumpy 0.70 still expects.
-import src.metric_hand_tracking.chumpy_compat  # noqa: F401
+# import src.metric_hand_tracking.chumpy_compat  # noqa: F401
 
+import inspect 
+if not hasattr(inspect, "getargspec"):
+    inspect.getargspec = inspect.getfullargspec
 warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -115,29 +117,11 @@ def main() -> None:
     p.add_argument("--grad-clip-val", type=float, default=0.0, help="0 = off (manual clip in model)")
     # multi-view
     p.add_argument("--max-views", type=int, default=4)
-    p.add_argument("--no-fusion", action="store_true",
-                   help="Disable the multi-view fusion transformer (per-view WiLoR + consistency loss only)")
     p.add_argument("--fusion-layers", type=int, default=8,
                    help="Number of alternating global/frame fusion layers (init from the ViT's last blocks)")
     p.add_argument("--fuse-camera-extrinsics", action="store_true",
                    help="Inject per-view camera pose (relative-to-reference) into the multi-view "
-                        "fusion attention; requires fusion (do not pass --no-fusion)")
-    # RefineNet adaptation: off => full finetune of RefineNet; on => freeze it, train high-rank LoRA
-    p.add_argument("--refine-lora", action="store_true",
-                   help="Freeze WiLoR's RefineNet and train high-rank LoRA deltas on its linear heads "
-                        "instead of full finetuning (mitigates catastrophic forgetting)")
-    p.add_argument("--refine-lora-rank", type=int, default=64, help="LoRA rank for the RefineNet heads")
-    p.add_argument("--refine-lora-alpha", type=float, default=None,
-                   help="LoRA scaling alpha (default: equal to rank => scaling 1.0)")
-    # ViT trunk adaptation: by default the backbone is frozen; this trains medium-rank LoRA deltas
-    # on its attention/MLP linears so the features themselves can adapt for multi-view.
-    p.add_argument("--refine-lora-vit-backbone", action="store_true",
-                   help="Train medium-rank LoRA deltas on the frozen ViT trunk's attn/MLP linears "
-                        "(lets the backbone features adapt for multi-view; uses more memory since "
-                        "the trunk forward must build an autograd graph)")
-    p.add_argument("--vit-lora-rank", type=int, default=64, help="LoRA rank for the ViT trunk blocks")
-    p.add_argument("--vit-lora-alpha", type=float, default=None,
-                   help="ViT trunk LoRA scaling alpha (default: equal to rank => scaling 1.0)")
+                        "fusion attention")
     # augmentation (mirror DATASETS.CONFIG.*); None -> keep config default
     p.add_argument("--scale-factor", type=float, default=None)
     p.add_argument("--rot-factor", type=float, default=None)
@@ -190,15 +174,8 @@ def main() -> None:
         wilor_ckpt=args.ckpt,
         wilor_cfg=args.wilor_cfg,
         max_views=args.max_views,
-        use_fusion=not args.no_fusion,
         fusion_layers=args.fusion_layers,
         fuse_camera_extrinsics=args.fuse_camera_extrinsics,
-        refine_lora=args.refine_lora,
-        refine_lora_rank=args.refine_lora_rank,
-        refine_lora_alpha=args.refine_lora_alpha,
-        vit_backbone_lora=args.refine_lora_vit_backbone,
-        vit_lora_rank=args.vit_lora_rank,
-        vit_lora_alpha=args.vit_lora_alpha,
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip_val=args.grad_clip_val,

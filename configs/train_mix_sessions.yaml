@@ -67,12 +67,10 @@ DATASETS:
   # re-export the dexycb frames with the training env's numpy before enabling these entries.
   # Use multiview_pinhole (v1, has images/); multiview_pinhole_v2 has no images/ yet.
   TRAIN:
-    # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/interhands2.6m/interhand_sessions/train
-    #   WEIGHT: 0.3
     - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/ho3d/ho3d_sessions/train
-      WEIGHT: 0.2
+      WEIGHT: 0.25
     - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/dexycb/processed/multiview_pinhole/train
-      WEIGHT: 0.2
+      WEIGHT: 0.25
     - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/oakink/sessions
       WEIGHT: 0.2
       BAD_RIGHT_VIEWS: [1]            # oakink view 1 is to the side, right hand usually occluded
@@ -85,8 +83,8 @@ DATASETS:
       WEIGHT: 0.1
       BAD_RIGHT_VIEWS: [1, 2]
       BAD_LEFT_VIEWS: [0, 3]
-    - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/interhands2.6m/interhand_sessions/train
-      WEIGHT: 0.1
+    # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/interhands2.6m/interhand_sessions/train
+    #   WEIGHT: 0.1
 
     # - PATH: /lambda/nfs/hfm/qasim/hand_kp_dataset/<next_dataset>/<sessions>  # placeholder
     #   WEIGHT: 0.0   # remember to rebalance so all TRAIN WEIGHTs sum to 1.0
