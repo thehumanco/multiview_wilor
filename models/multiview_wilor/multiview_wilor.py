@@ -9,7 +9,7 @@ outputs back into per-(frame, view) dicts and hands them to ``compute_multiview_
 Design (see MULTIVIEW_MODEL.md): one shared-weight WiLoR, a single batched forward over all
 1-MAX_VIEWS selected-view crops (no padding, no per-view loop, no 4 separate weight sets).
 """
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -213,7 +213,8 @@ class MultiViewWiLoR(pl.LightningModule):
         return per_view
 
     def _fuse_views(
-        self, tokens: torch.Tensor, batch: Dict[int, Dict], sel: List[ViewSelection]
+        self, tokens: torch.Tensor, batch: Dict[int, Dict], sel: List[ViewSelection],
+        extrinsics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run multi-view fusion over the flat token batch, returning fused tokens in the
         same row order.
@@ -221,8 +222,13 @@ class MultiViewWiLoR(pl.LightningModule):
         Rows are grouped by (frame, hand_id) — the views of one physical hand — then hands
         are bucketed by view count V so each fusion call sees a rectangular (G, V, N, C)
         tensor (attention is length-agnostic; bucketing avoids padded tokens entirely).
+
+        ``extrinsics`` (when fusing camera pose) is the on-device ``(total_hands, 3, 4)`` tensor
+        already gathered by ``_gather_flat_gt`` in the same flat row order as ``tokens`` — reused
+        here so we don't re-gather + re-copy it from the CPU batch.
         """
-        # flat row index -> (frame, hand_id) group
+        # flat row index -> (frame, hand_id) group. hand_id lives on the CPU batch, so .tolist()
+        # is a host-only read (no GPU sync) — keep the grouping on the CPU side.
         groups: Dict[tuple, List[int]] = {}
         offset = 0
         for s in sel:
@@ -231,33 +237,41 @@ class MultiViewWiLoR(pl.LightningModule):
                 groups.setdefault((s.frame, int(hid)), []).append(offset + j)
             offset += s.num_hands
 
-        # bucket hand-groups by view count; one rectangular fusion call per bucket
+        # bucket hand-groups by view count (one rectangular fusion call per bucket), laid out
+        # contiguously in ONE permutation so tokens/extrinsics are gathered with a single
+        # host->device index transfer instead of one per bucket.
         by_v: Dict[int, List[List[int]]] = {}
         for rows in groups.values():
             by_v.setdefault(len(rows), []).append(rows)
 
-        # gather extrinsics in the SAME flat row order as tokens (only when fusing them)
-        extr_flat = None
-        if self._fuse_cam:
-            extr_flat = torch.cat(
-                [batch[s.view]["extrinsics"][s.row_mask] for s in sel], dim=0
-            ).to(tokens.device, tokens.dtype)  # (total_hands, 3, 4)
+        order: List[int] = []
+        spans: List[tuple] = []  # (V, G_v, start, end) slices into `order`
+        for V, row_lists in by_v.items():
+            start = len(order)
+            for rows in row_lists:
+                order.extend(rows)
+            spans.append((V, len(row_lists), start, len(order)))
+        perm = torch.tensor(order, device=tokens.device, dtype=torch.long)
 
         N, C = tokens.shape[1], tokens.shape[2]
-        idx_parts, out_parts = [], []
-        for V, row_lists in by_v.items():
-            idx = torch.tensor(
-                [r for rows in row_lists for r in rows], device=tokens.device, dtype=torch.long
-            )
-            extr = extr_flat[idx].view(len(row_lists), V, 3, 4) if extr_flat is not None else None
-            fused = self.fusion(tokens[idx].view(len(row_lists), V, N, C), extr)
-            idx_parts.append(idx)
-            out_parts.append(fused.reshape(-1, N, C))
+        tokens_perm = tokens[perm]  # (M, N, C), gathered once
+        extr_perm = (
+            extrinsics[perm].to(tokens.dtype)
+            if (self._fuse_cam and extrinsics is not None) else None
+        )
 
-        # every flat row belongs to exactly one group -> invert the gather permutation
-        all_idx = torch.cat(idx_parts)
-        order = torch.argsort(all_idx)
-        return torch.cat(out_parts, dim=0)[order]
+        out_parts = []
+        for V, G_v, start, end in spans:
+            extr_b = extr_perm[start:end].view(G_v, V, 3, 4) if extr_perm is not None else None
+            fused = self.fusion(tokens_perm[start:end].view(G_v, V, N, C), extr_b)
+            out_parts.append(fused.reshape(G_v * V, N, C))
+
+        # invert the gather permutation (perm is a bijection over the M rows): scatter arange to
+        # build the inverse, then gather back to original flat order — cheaper than argsort.
+        fused_perm = torch.cat(out_parts, dim=0)  # in `perm` order
+        inv = torch.empty_like(perm)
+        inv[perm] = torch.arange(perm.numel(), device=perm.device)
+        return fused_perm[inv]
 
     # --------------------------------------------------------------------- forward
     def forward_step(self, batch: Dict[int, Dict]) -> Dict:
@@ -270,10 +284,12 @@ class MultiViewWiLoR(pl.LightningModule):
         # pretrained decode heads + RefineNet (per view, unchanged).
         with torch.no_grad():
             tokens, (Hp, Wp) = self.wilor.backbone.forward_tokens(imgs[:, :, :, 32:-32])
-        fused = self._fuse_views(tokens, batch, sel)
+        # Gather GT before fusion: the non_blocking H2D copies overlap the fusion compute, and
+        # _fuse_views reuses the on-device extrinsics instead of re-copying them from the batch.
+        flat_gt = self._gather_flat_gt(batch, sel)
+        fused = self._fuse_views(tokens, batch, sel, flat_gt["extrinsics"])
         backbone_out = self.wilor.backbone.decode_tokens(fused, Hp, Wp)
         out = self.wilor.forward_step({"img": imgs}, train=self.training, backbone_out=backbone_out)
-        flat_gt = self._gather_flat_gt(batch, sel)
         per_view = self._split_outputs(out, imgs, flat_gt, sel)
         return {"selections": sel, "per_view": per_view}
 

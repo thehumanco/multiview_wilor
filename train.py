@@ -13,6 +13,7 @@ paths). The train.sh wrapper cd's there for you; the smoke command in MULTIVIEW_
 ``python -m src.metric_hand_tracking_v2.wilor_v2.train``.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 import warnings
@@ -92,7 +93,20 @@ def build_logger(args: argparse.Namespace, output_dir: Path):
     try:
         from pytorch_lightning.loggers import WandbLogger
 
-        return WandbLogger(name=args.run_name, project=args.project, save_dir=str(output_dir))
+        # entity must be explicit when the wandb account has no default entity set
+        # server-side (otherwise init fails with "entityName required for model query").
+        # Fall back to the logged-in user so a fresh account without a default
+        # entity still works without passing --wandb-entity.
+        # Precedence: explicit flag > $WANDB_ENTITY > the 'qasim_ali-gsi' team.
+        # An explicit entity is required because the account's server-side default
+        # entity resolves to a bogus "models" value (otherwise init fails with
+        # "entityName required for model query"). The 'thehumanco' org currently
+        # rejects writes ("user does not have models write access for this org"),
+        # so default to the personal team that works.
+        entity = args.wandb_entity or os.environ.get("WANDB_ENTITY") or "qasim_ali-gsi"
+        return WandbLogger(
+            name=args.run_name, project=args.project, save_dir=str(output_dir), entity=entity
+        )
     except ModuleNotFoundError as exc:  # graceful degradation, like rf-detr
         print(f"WandB logging disabled: {exc}. Install with: pip install wandb")
         return None
@@ -111,8 +125,8 @@ def main() -> None:
     p.add_argument("--run-name", type=str, default="wilor-v2")
     # optimization (mirror WiLoR TRAIN.*)
     p.add_argument("--epochs", type=int, default=18)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1.0e-5)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=8.0e-6)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip-val", type=float, default=0.0, help="0 = off (manual clip in model)")
     # multi-view
@@ -147,6 +161,9 @@ def main() -> None:
                    help=f"Delete the dataset index cache ({_INDEX_CACHE_DIR}) and rebuild from scratch")
     p.add_argument("--resume", type=str, default=None, help="Path to a .ckpt to resume training from (optimizer state, step, epoch are all restored)")
     p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--wandb-entity", type=str, default=None,
+                   help="wandb entity (team/username). Defaults to the 'qasim_ali-gsi' team. "
+                        "Override with this flag or $WANDB_ENTITY to log elsewhere.")
     p.add_argument("--project", type=str, default="multiview-wilor")
     p.add_argument("--log-every-n-steps", type=int, default=1000)
     p.add_argument("--log-media-every-n-steps", type=int, default=1000, help="0 = no media logging")
